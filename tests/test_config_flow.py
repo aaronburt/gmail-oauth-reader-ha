@@ -7,7 +7,8 @@ from custom_components.gmail_oauth_reader.config_flow import GmailOAuthFlowHandl
 from custom_components.gmail_oauth_reader.const import (
     CONF_ENABLE_WRITE,
     CONF_POLL_INTERVAL,
-    SCOPE_GMAIL_SEND,
+    SCOPE_GMAIL_MODIFY,
+    SCOPE_GMAIL_READONLY,
 )
 
 
@@ -24,12 +25,13 @@ def test_config_flow_extra_authorize_data() -> None:
     flow = GmailOAuthFlowHandler()
     flow._enable_write = False
     data = flow.extra_authorize_data
-    assert SCOPE_GMAIL_SEND not in data['scope']
+    assert SCOPE_GMAIL_READONLY in data['scope']
+    assert SCOPE_GMAIL_MODIFY not in data['scope']
     assert 'access_type' in data
 
     flow._enable_write = True
     data_write = flow.extra_authorize_data
-    assert SCOPE_GMAIL_SEND in data_write['scope']
+    assert SCOPE_GMAIL_MODIFY in data_write['scope']
 
 
 async def test_options_flow_init_and_update(

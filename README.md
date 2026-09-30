@@ -45,8 +45,8 @@ Google requires OAuth credentials so Home Assistant can access your inbox.
 4. Click **Save and Continue**.
 5. On the **Scopes** page:
    - Click **Add or Remove Scopes**.
-   - Manually enter or search for: `https://www.googleapis.com/auth/gmail.modify`
-   - *(Optional)* If you plan to send emails from Home Assistant, also add: `https://www.googleapis.com/auth/gmail.send`
+   - For read-only access (inbox monitoring, 2FA code extraction): add `https://www.googleapis.com/auth/gmail.readonly`
+   - *(Optional)* If you plan to send emails or modify labels (mark read/archive) from Home Assistant: add `https://www.googleapis.com/auth/gmail.modify`
    - Click **Update**, then click **Save and Continue**.
 6. On the **Test users** page:
    - Click **Add Users** and enter your Gmail address.
@@ -213,7 +213,39 @@ To adjust options after installation, go to **Settings** > **Devices & Services*
 | **Search query filter** | `is:unread label:INBOX` | Gmail query syntax used to filter retrieved messages. |
 | **Extract 2FA / OTP codes** | `true` | Scans inbound emails for verification codes and delivery PINs. |
 | **OTP code expiration** | `15` | Minutes a detected code remains in `sensor.gmail_latest_otp` before clearing to `'idle'`. |
-| **Enable Write Access** | `false` | Grants `gmail.send` scope for the `send_email` action. Triggers an OAuth re-authentication when enabled. |
+| **Enable Write Access** | `false` | Grants `gmail.modify` scope for sending mail and modifying labels. Triggers an OAuth re-authentication when changed. Defaults to least-privilege `gmail.readonly`. |
+
+---
+
+## Security, Privacy & Recorder Optimization
+
+### Least Privilege OAuth
+By default, the integration requests only `gmail.readonly`, granting zero ability to send or alter emails if tokens were ever compromised. Outbound sending (`gmail_oauth_reader.send_email`) and label updates (`gmail_oauth_reader.modify_email`) require explicitly enabling **Enable Write Access**, which initiates a re-authentication flow requesting `gmail.modify`.
+
+### Excluding Sensitive Sensors from Recorder
+`sensor.gmail_latest_otp` holds transient authentication passcodes as its state, while `sensor.gmail_latest_email` provides recent email previews. To prevent storing sensitive one-time passcodes and high-frequency email previews in your Home Assistant database history, exclude them in your `configuration.yaml`:
+
+```yaml
+recorder:
+  exclude:
+    entities:
+      - sensor.gmail_latest_otp
+      - sensor.gmail_latest_email
+```
+
+Automations triggered by `gmail_oauth_reader_new_otp` or state triggers continue to work normally in real-time even when excluded from the long-term recorder database.
+
+### Multi-Account Configurations
+If multiple Gmail accounts are configured in Home Assistant, actions like `gmail_oauth_reader.send_email` or `gmail_oauth_reader.get_email_content` require the `entry_id` parameter to target the specific account:
+
+```yaml
+action: gmail_oauth_reader.send_email
+data:
+  entry_id: "your_config_entry_id_here"
+  to: "recipient@example.com"
+  subject: "Report"
+  body: "Automated report."
+```
 
 ---
 

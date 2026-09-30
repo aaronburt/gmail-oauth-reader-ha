@@ -22,7 +22,9 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator: GmailDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator: GmailDataUpdateCoordinator = (
+        getattr(entry, "runtime_data", None) or hass.data[DOMAIN][entry.entry_id]
+    )
     async_add_entities(
         [
             GmailLatestEmailSensor(coordinator, entry),

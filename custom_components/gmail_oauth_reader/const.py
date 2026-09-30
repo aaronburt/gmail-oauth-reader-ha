@@ -6,11 +6,19 @@ GMAIL_MESSAGES_URL: Final = "https://gmail.googleapis.com/gmail/v1/users/me/mess
 GMAIL_SEND_URL: Final = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
 GMAIL_PROFILE_URL: Final = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
 
+SCOPE_GMAIL_READONLY: Final = "https://www.googleapis.com/auth/gmail.readonly"
+SCOPE_GMAIL_MODIFY: Final = "https://www.googleapis.com/auth/gmail.modify"
 SCOPE_GMAIL_SEND: Final = "https://www.googleapis.com/auth/gmail.send"
 
-SCOPES: Final = [
-    "https://www.googleapis.com/auth/gmail.modify",
+SCOPES_READONLY: Final = [
+    SCOPE_GMAIL_READONLY,
 ]
+
+SCOPES_WRITE: Final = [
+    SCOPE_GMAIL_MODIFY,
+]
+
+SCOPES: Final = SCOPES_READONLY
 
 CONF_QUERY: Final = "query"
 DEFAULT_QUERY: Final = "is:unread label:INBOX"

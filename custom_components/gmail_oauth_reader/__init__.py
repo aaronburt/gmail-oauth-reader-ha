@@ -115,13 +115,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    entry.runtime_data = coordinator
 
     def get_coordinator(entry_id: str | None) -> GmailDataUpdateCoordinator:
-        if entry_id and entry_id in hass.data[DOMAIN]:
-            return hass.data[DOMAIN][entry_id]
-        if hass.data.get(DOMAIN):
-            return next(iter(hass.data[DOMAIN].values()))
-        raise HomeAssistantError("No Gmail integration configured")
+        coordinators: dict[str, GmailDataUpdateCoordinator] = hass.data.get(DOMAIN, {})
+        if not coordinators:
+            raise HomeAssistantError("No Gmail integration configured")
+        if entry_id:
+            if entry_id in coordinators:
+                return coordinators[entry_id]
+            raise HomeAssistantError(f"Gmail account with entry_id '{entry_id}' not found")
+        if len(coordinators) == 1:
+            return next(iter(coordinators.values()))
+        raise HomeAssistantError(
+            "Multiple Gmail accounts configured; 'entry_id' parameter must be specified"
+        )
 
     def get_message_id(
         active_coordinator: GmailDataUpdateCoordinator,

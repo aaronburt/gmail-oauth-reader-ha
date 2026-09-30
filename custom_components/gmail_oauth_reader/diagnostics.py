@@ -21,7 +21,9 @@ async def async_get_config_entry_diagnostics(
     hass: HomeAssistant,
     entry: ConfigEntry,
 ) -> dict[str, Any]:
-    coordinator: GmailDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator: GmailDataUpdateCoordinator = (
+        getattr(entry, "runtime_data", None) or hass.data[DOMAIN][entry.entry_id]
+    )
     return {
         "entry": async_redact_data(entry.as_dict(), TO_REDACT),
         "coordinator": {

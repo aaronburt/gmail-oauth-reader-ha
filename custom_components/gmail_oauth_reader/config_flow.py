@@ -36,7 +36,8 @@ from .const import (
     MIN_POLL_INTERVAL,
     MIN_QUEUE_DWELL_TIME,
     SCOPE_GMAIL_SEND,
-    SCOPES,
+    SCOPES_READONLY,
+    SCOPES_WRITE,
 )
 from .repairs import async_delete_issue
 
@@ -59,9 +60,7 @@ class GmailOAuthFlowHandler(
 
     @property
     def extra_authorize_data(self) -> dict[str, Any]:
-        scopes = list(SCOPES)
-        if self._enable_write:
-            scopes.append(SCOPE_GMAIL_SEND)
+        scopes = list(SCOPES_WRITE) if self._enable_write else list(SCOPES_READONLY)
         return {
             "scope": " ".join(scopes),
             "access_type": "offline",
@@ -123,7 +122,7 @@ class GmailOAuthFlowHandler(
     async def async_oauth_create_entry(self, data: dict[str, Any]) -> FlowResult:
         token = data.get("token", {}).get("access_token")
         headers = {"Authorization": f"Bearer {token}"}
-        email_address = "Gmail Account"
+        email_address: str | None = None
 
         session = config_entry_oauth2_flow.async_get_clientsession(self.hass)
         try:
@@ -131,9 +130,12 @@ class GmailOAuthFlowHandler(
                 async with session.get(GMAIL_PROFILE_URL, headers=headers) as resp:
                     if resp.status == 200:
                         profile = await resp.json()
-                        email_address = profile.get("emailAddress", "Gmail Account")
-        except Exception:
-            pass
+                        email_address = profile.get("emailAddress")
+        except Exception as err:
+            _LOGGER.warning("Failed to fetch Gmail profile during OAuth setup: %s", err)
+
+        if not email_address:
+            return self.async_abort(reason="oauth_failed")
 
         await self.async_set_unique_id(email_address)
 

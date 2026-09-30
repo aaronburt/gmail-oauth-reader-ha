@@ -288,10 +288,15 @@ class GmailDataUpdateCoordinator(DataUpdateCoordinator[GmailMessage | None]):
         try:
             async with asyncio.timeout(10):
                 resp = await self._session.async_request("GET", url, params=params)
-                if resp.status in (400, 401):
+                if resp.status == 401:
                     self._handle_auth_failure(
                         f"Authentication failed fetching message {message_id}: {resp.status}"
                     )
+                if resp.status in (400, 403):
+                    _LOGGER.warning(
+                        "Error %s fetching message %s from Gmail API", resp.status, message_id
+                    )
+                    return None
                 if resp.status in (429, 503):
                     raise UpdateFailed(
                         f"Rate limited or server error fetching message {message_id}: {resp.status}"
@@ -360,9 +365,17 @@ class GmailDataUpdateCoordinator(DataUpdateCoordinator[GmailMessage | None]):
                 resp = await self._session.async_request(
                     "GET", GMAIL_MESSAGES_URL, params=params
                 )
-                if resp.status in (400, 401):
+                if resp.status == 401:
                     self._handle_auth_failure(
                         f"Authentication failed querying messages: {resp.status}"
+                    )
+                if resp.status == 400:
+                    raise UpdateFailed(
+                        f"Invalid search query or request parameters: {resp.status}"
+                    )
+                if resp.status == 403:
+                    raise UpdateFailed(
+                        f"Gmail API access forbidden or quota exceeded: {resp.status}"
                     )
                 if resp.status in (429, 503):
                     raise UpdateFailed(
@@ -383,7 +396,7 @@ class GmailDataUpdateCoordinator(DataUpdateCoordinator[GmailMessage | None]):
 
         async_delete_issue(self.hass, self._entry.entry_id)
         messages = data.get("messages", [])
-        self._unread_count = len(messages)
+        self._unread_count = data.get("resultSizeEstimate", len(messages))
         self._last_polled = datetime.now(timezone.utc)
 
         if self._initial_run:
@@ -578,7 +591,7 @@ class GmailDataUpdateCoordinator(DataUpdateCoordinator[GmailMessage | None]):
         try:
             async with asyncio.timeout(15):
                 resp = await self._session.async_request("GET", url, params=params)
-                if resp.status in (400, 401):
+                if resp.status == 401:
                     self._handle_auth_failure(
                         f"Authentication failed fetching full email {message_id}: {resp.status}"
                     )
@@ -645,6 +658,12 @@ class GmailDataUpdateCoordinator(DataUpdateCoordinator[GmailMessage | None]):
         add_labels: list[str] | None = None,
         remove_labels: list[str] | None = None,
     ) -> dict[str, Any]:
+        if not self.is_write_enabled:
+            raise HomeAssistantError(
+                "Write/modify access is not enabled for this Gmail account. "
+                "Please re-authenticate to grant write permissions."
+            )
+
         if message_id.startswith(SIMULATED_MESSAGE_PREFIX):
             return {
                 "message_id": message_id,
@@ -659,7 +678,7 @@ class GmailDataUpdateCoordinator(DataUpdateCoordinator[GmailMessage | None]):
         try:
             async with asyncio.timeout(10):
                 resp = await self._session.async_request("POST", url, json=payload)
-                if resp.status in (400, 401):
+                if resp.status == 401:
                     self._handle_auth_failure(
                         f"Authentication failed modifying email {message_id}: {resp.status}"
                     )
@@ -689,7 +708,7 @@ class GmailDataUpdateCoordinator(DataUpdateCoordinator[GmailMessage | None]):
         try:
             async with asyncio.timeout(15):
                 resp = await self._session.async_request("GET", url)
-                if resp.status in (400, 401):
+                if resp.status == 401:
                     self._handle_auth_failure(
                         f"Authentication failed downloading attachment: {resp.status}"
                     )

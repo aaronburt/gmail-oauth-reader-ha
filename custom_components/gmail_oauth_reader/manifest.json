@@ -8,5 +8,5 @@
   "integration_type": "service",
   "iot_class": "cloud_polling",
   "dependencies": ["application_credentials", "http"],
-  "version": "1.7.0"
+  "version": "1.8.0"
 }
