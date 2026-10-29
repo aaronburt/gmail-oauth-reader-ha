@@ -13,7 +13,8 @@ from pathlib import Path
 import random
 import re
 import secrets
-from typing import Any
+import time
+from typing import Any, NamedTuple
 
 import aiohttp
 
@@ -41,7 +42,11 @@ from .const import (
     EVENT_GMAIL_NEW_OTP,
     GMAIL_MESSAGES_URL,
     GMAIL_SEND_URL,
+    LATE_ARRIVAL_GRACE_MS,
+    LIST_PAGE_SIZE,
     MAX_BODY_PREVIEW_LENGTH,
+    MAX_DETAIL_FETCH_ATTEMPTS,
+    MAX_LIST_PAGES,
     MAX_RECENT_EMAILS,
     MAX_SEEN_CACHE_SIZE,
     SIMULATED_MESSAGE_PREFIX,
@@ -62,6 +67,28 @@ class GmailMessage:
     body_preview: str
     received_time: str
     otp_code: str | None = None
+
+
+class FetchedMessage(NamedTuple):
+    message: GmailMessage
+    internal_date_ms: int | None
+
+
+def utc_now_ms() -> int:
+    return time.time_ns() // 1_000_000
+
+
+def parse_internal_date(value: Any) -> int | None:
+    """Parse Gmail's top-level internalDate (epoch milliseconds, sent as a string)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        parsed = int(value.strip())
+    else:
+        return None
+    return parsed if parsed > 0 else None
 
 
 def decode_mime_header(header_value: str) -> str:
@@ -207,6 +234,14 @@ class GmailDataUpdateCoordinator(DataUpdateCoordinator[GmailMessage | None]):
         self._otp_received_at: datetime | None = None
         self._otp_expiry_timer: asyncio.Task[None] | None = None
         self._simulated_messages: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        # All freshness timestamps are UTC epoch milliseconds, the unit of Gmail's internalDate.
+        self._started_at: int = utc_now_ms()
+        self._baseline_ms: int = self._started_at
+        self._watermark_ms: int = self._started_at
+        self._recent_accepted: dict[str, int] = {}
+        self._retry_state: OrderedDict[str, tuple[int, int]] = OrderedDict()
+        self._active_query: str | None = None
+        self._last_poll_started_ms: int | None = None
 
     @property
     def is_write_enabled(self) -> bool:
@@ -275,11 +310,22 @@ class GmailDataUpdateCoordinator(DataUpdateCoordinator[GmailMessage | None]):
         if len(self._seen_message_ids) > MAX_SEEN_CACHE_SIZE:
             self._seen_message_ids.popitem(last=False)
 
+    def _freshness_floor(self) -> int:
+        return max(self._baseline_ms, self._watermark_ms - LATE_ARRIVAL_GRACE_MS)
+
+    def _is_fresh(self, message_id: str, internal_date_ms: int, floor: int) -> bool:
+        if message_id in self._recent_accepted:
+            return False
+        retry = self._retry_state.get(message_id)
+        if retry is not None:
+            floor = min(floor, retry[0])
+        return internal_date_ms >= floor
+
     def _handle_auth_failure(self, error_message: str) -> None:
         async_create_issue(self.hass, self._entry)
         raise ConfigEntryAuthFailed(error_message)
 
-    async def _fetch_message_details(self, message_id: str) -> GmailMessage | None:
+    async def _fetch_message_details(self, message_id: str) -> FetchedMessage | None:
         url = f"{GMAIL_MESSAGES_URL}/{message_id}"
         params = {
             "format": "metadata",
@@ -330,7 +376,7 @@ class GmailDataUpdateCoordinator(DataUpdateCoordinator[GmailMessage | None]):
             extract_otp_code(subject, raw_snippet) if extract_otp else None
         )
 
-        return GmailMessage(
+        message = GmailMessage(
             message_id=message_id,
             sender=display_sender,
             sender_name=sender_name,
@@ -340,26 +386,25 @@ class GmailDataUpdateCoordinator(DataUpdateCoordinator[GmailMessage | None]):
             received_time=received_time,
             otp_code=otp_code,
         )
+        return FetchedMessage(message, parse_internal_date(data.get("internalDate")))
 
     async def _fetch_messages_bounded(
         self, message_ids: list[str]
-    ) -> list[GmailMessage]:
+    ) -> list[FetchedMessage | None]:
         semaphore = asyncio.Semaphore(5)
 
-        async def _fetch(msg_id: str) -> GmailMessage | None:
+        async def _fetch(msg_id: str) -> FetchedMessage | None:
             async with semaphore:
                 return await self._fetch_message_details(msg_id)
 
-        results = await asyncio.gather(*(_fetch(mid) for mid in message_ids))
-        return [msg for msg in results if msg is not None]
+        return list(await asyncio.gather(*(_fetch(mid) for mid in message_ids)))
 
-    async def _async_update_data(self) -> GmailMessage | None:
-        if self._entry.data.get("simulated"):
-            self._last_polled = datetime.now(timezone.utc)
-            return self._active_message
-
-        query = self._entry.options.get(CONF_QUERY, DEFAULT_QUERY)
-        params = {"q": query, "maxResults": "20"}
+    async def _list_messages(
+        self, query: str, page_token: str | None
+    ) -> dict[str, Any]:
+        params = {"q": query, "maxResults": str(LIST_PAGE_SIZE)}
+        if page_token:
+            params["pageToken"] = page_token
         try:
             async with asyncio.timeout(10):
                 resp = await self._session.async_request(
@@ -385,7 +430,7 @@ class GmailDataUpdateCoordinator(DataUpdateCoordinator[GmailMessage | None]):
                     raise UpdateFailed(
                         f"Unexpected response querying messages: {resp.status}"
                     )
-                data = await resp.json()
+                return await resp.json()
         except ConfigEntryAuthFailed:
             async_create_issue(self.hass, self._entry)
             raise
@@ -394,33 +439,109 @@ class GmailDataUpdateCoordinator(DataUpdateCoordinator[GmailMessage | None]):
         except aiohttp.ClientError as err:
             raise UpdateFailed(f"Network error querying messages: {err}") from err
 
-        async_delete_issue(self.hass, self._entry.entry_id)
-        messages = data.get("messages", [])
-        self._unread_count = data.get("resultSizeEstimate", len(messages))
-        self._last_polled = datetime.now(timezone.utc)
-
-        if self._initial_run:
-            for message_summary in messages:
-                self._record_seen(message_summary["id"])
-            initial_ids = [
-                m["id"] for m in reversed(messages[:MAX_RECENT_EMAILS])
-            ]
-            initial_details = await self._fetch_messages_bounded(initial_ids)
-            for details in initial_details:
-                self._recent_emails.append(details)
-                self._last_message = details
-            self._initial_run = False
+    async def _async_update_data(self) -> GmailMessage | None:
+        if self._entry.data.get("simulated"):
+            self._last_polled = datetime.now(timezone.utc)
             return self._active_message
 
-        new_message_ids = [
-            m["id"]
-            for m in reversed(messages)
-            if m["id"] not in self._seen_message_ids
-        ]
-        for msg_id in new_message_ids:
-            self._record_seen(msg_id)
+        query = self._entry.options.get(CONF_QUERY, DEFAULT_QUERY)
+        if self._active_query is not None and query != self._active_query:
+            # Mail that only matches the new query is history, not new arrivals.
+            self._baseline_ms = max(
+                self._baseline_ms, self._last_poll_started_ms or utc_now_ms()
+            )
+        self._active_query = query
 
-        new_messages = await self._fetch_messages_bounded(new_message_ids)
+        poll_started_ms = utc_now_ms()
+        floor = self._freshness_floor()
+        listed_ids: set[str] = set()
+        fresh: list[FetchedMessage] = []
+        stale_ids: list[str] = []
+        failed_ids: list[str] = []
+        initial_history: list[GmailMessage] = []
+        page_token: str | None = None
+
+        for page_index in range(MAX_LIST_PAGES):
+            data = await self._list_messages(query, page_token)
+            page_ids = [
+                summary["id"]
+                for summary in data.get("messages", [])
+                if summary.get("id")
+            ]
+            if page_index == 0:
+                async_delete_issue(self.hass, self._entry.entry_id)
+                self._unread_count = data.get("resultSizeEstimate", len(page_ids))
+                self._last_polled = datetime.now(timezone.utc)
+
+            candidates = [
+                mid
+                for mid in page_ids
+                if mid not in listed_ids and mid not in self._seen_message_ids
+            ]
+            listed_ids.update(page_ids)
+            records = await self._fetch_messages_bounded(candidates)
+
+            page_has_recent = any(mid in self._recent_accepted for mid in page_ids)
+            for mid, record in zip(candidates, records):
+                if record is None:
+                    failed_ids.append(mid)
+                elif record.internal_date_ms is None:
+                    _LOGGER.warning(
+                        "Gmail message %s has no valid internalDate; not announcing it",
+                        mid,
+                    )
+                    stale_ids.append(mid)
+                elif self._is_fresh(mid, record.internal_date_ms, floor):
+                    fresh.append(record)
+                    page_has_recent = True
+                else:
+                    stale_ids.append(mid)
+                    if self._initial_run:
+                        initial_history.append(record.message)
+
+            page_token = data.get("nextPageToken")
+            if not page_token or not page_has_recent:
+                break
+
+        for mid in stale_ids:
+            self._record_seen(mid)
+            self._retry_state.pop(mid, None)
+        for record in fresh:
+            mid = record.message.message_id
+            self._record_seen(mid)
+            self._retry_state.pop(mid, None)
+            self._recent_accepted[mid] = record.internal_date_ms
+        for mid in failed_ids:
+            retry_floor, attempts = self._retry_state.pop(mid, (floor, 0))
+            attempts += 1
+            if attempts >= MAX_DETAIL_FETCH_ATTEMPTS:
+                _LOGGER.warning(
+                    "Giving up on Gmail message %s after %s failed fetches", mid, attempts
+                )
+                self._record_seen(mid)
+                continue
+            self._retry_state[mid] = (min(retry_floor, floor), attempts)
+            if len(self._retry_state) > MAX_SEEN_CACHE_SIZE:
+                self._retry_state.popitem(last=False)
+
+        if fresh:
+            self._watermark_ms = max(
+                self._watermark_ms, max(r.internal_date_ms for r in fresh)
+            )
+        new_floor = self._freshness_floor()
+        self._recent_accepted = {
+            mid: ts for mid, ts in self._recent_accepted.items() if ts >= new_floor
+        }
+        self._last_poll_started_ms = poll_started_ms
+
+        if self._initial_run:
+            for message in reversed(initial_history[:MAX_RECENT_EMAILS]):
+                self._recent_emails.append(message)
+                self._last_message = message
+            self._initial_run = False
+
+        fresh.sort(key=lambda r: (r.internal_date_ms, r.message.message_id))
+        new_messages = [record.message for record in fresh]
 
         extract_otp = self._entry.options.get(
             CONF_EXTRACT_OTP, DEFAULT_EXTRACT_OTP
